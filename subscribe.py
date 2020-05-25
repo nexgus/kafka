@@ -7,9 +7,10 @@ import time
 
 from datetime import datetime
 from kafka import KafkaConsumer
+from kafka import TopicPartition
 from multiprocessing import Process
 
-####################################################################################################
+##############################################################################
 VER_MAJOR = 0
 VER_MINOR = 1
 VER_PATCH = 0
@@ -26,7 +27,8 @@ logger = logging.getLogger('nexgus-publish')
 logger.setLevel(logging.INFO)
 
 ##############################################################################
-def consume(cid, broker, topics, timeout=None, mysql_host=None):
+def consume(cid, broker, topic, partition=None,
+            timeout=None, mysql_host=None, from_start=False):
     """ Create a consumer and consumes specified topics.
 
     Args:
@@ -37,11 +39,14 @@ def consume(cid, broker, topics, timeout=None, mysql_host=None):
             consumer group administration.
         broker (str): The 'host[:port]' string that the producer should 
             contact to bootstrap initial cluster metadata.
-        topics (list): List of topics for subscription.
+        topic (str): Topic.
+        partition (int): The partition number of specified topic (default 
+            None).
         timeout (float): Number of seconds to block during message iteration 
             before close (default None).
         mysql_host (str): Host name or IP address of MySQL server. If this is 
             specified, all messages will be saved in it (default None).
+        from_start (bool): Receive message from the beginning (default False)
     """
     if mysql_host:
         cnx = mysql.connector.connect(
@@ -55,33 +60,49 @@ def consume(cid, broker, topics, timeout=None, mysql_host=None):
         # Convert to milliseconds.
         timeout = int(args.timeout * 1000)
 
-    consumer = KafkaConsumer(
-        bootstrap_servers=[broker],
-        client_id=cid,
-        group_id='nexgus-consumer-group',
-        auto_offset_reset='earliest',
-        consumer_timeout_ms=timeout,
-    )
-    consumer.subscribe(topics)
-    logger.info(f'{cid}: subscribes to {topics}.')
+    try:
+        consumer = KafkaConsumer(
+            bootstrap_servers=[broker],
+            client_id=cid,
+            group_id='nexgus-consumer-group',
+            auto_offset_reset='earliest',
+            consumer_timeout_ms=timeout,
+        )
+    except kafka.errors.NoBrokersAvailable:
+        logger.warning(f'Cannot establish connection to {broker}. '
+                        f'Producer {cid} is not created.')
+        return
+    except Exception as ex:
+        print(f'----------> {cid}')
+        raise
 
-    # indices stores received current index for each topic
-    indices = {}
-    for topic in topics:
-        indices[topic] = 0
+    # Subscribe
+    if isinstance(partition, int):
+        tp_partition = TopicPartition(topic, partition)
+        consumer.assign([tp_partition])
+    else:
+        tp_partition = None
+        consumer.subscribe([topic])
+        partition = consumer.assignment().pop()
+    logger.info(f'{cid}: subscribes to "{topic}" @ partition {partition}.')
 
+    # Seek to beginning
+    if from_start and tp_partition:
+        consumer.seek_to_beginning()
+        logger.info(f'{cid}: Seek to beginning.')
+
+    index = 0
     for record in consumer:
         # A record is an instance of <kafka.consumer.fetcher.ConsumerRecord>
         time_str = datetime.fromtimestamp(record.timestamp / 1000).strftime(
             '%Y/%m/%d %H:%M:%S.%f'
         )
         logger.info(f'{cid}: [{time_str}] {record.topic} '
-                    f'RX #{indices[record.topic]} {record.serialized_value_size}')
+                    f'RX #{index} {record.serialized_value_size}')
         if mysql_host:
             save_to_mysql(cnx, message)
             logger.info(f'{cid}: Save message to MySQL ({mysql_host}).')
-
-        indices[record.topic] += 1
+        index += 1
 
     consumer.close()
     logger.info(f'{cid}: Close.')
@@ -126,6 +147,37 @@ def save_to_mysql(cnx, record, cid=''):
     cursor.close()
 
 ##############################################################################
+def topic_partitions(topic, broker):
+    """Get partitions of a topic.
+
+    Args:
+        topic (str): Topic.
+        broker (str): The 'host[:port]' string that the producer should 
+            contact to bootstrap initial cluster metadata.
+
+    Returns:
+        A None is returned if there is not specified topic.
+        If it exists, return a set which incluing all partion numbers.
+    """
+    try:
+        consumer = KafkaConsumer(bootstrap_servers=[broker])
+    except kafka.errors.NoBrokersAvailable:
+        logger.warning(f'Cannot establish connection to {broker}.')
+        return
+    except Exception as ex:
+        print('----------> topic_partitions()')
+        raise
+
+    topics = consumer.topics()
+    if topic not in topics:
+        partitions = None
+    else:
+        partitions = consumer.partitions_for_topic(topic)
+    consumer.close()
+
+    return partitions
+
+##############################################################################
 def main(args):
     if args.mysql:
         cnx = mysql.connector.connect(
@@ -156,16 +208,26 @@ def main(args):
                       'DEFAULT CHARACTER SET = utf8')
         cnx.close()
 
+    partitions = topic_partitions(args.topic, args.broker)
+    if partitions is None:
+        pass
+
     processes = []
-    for partition in range(args.consumers):
+    for idx in range(args.consumers):
+        partition = None
+        if len(partitions) > 0:
+            partition = partitions.pop()
+
         p = Process(
             target=consume, 
             args=(
-                f'nexgus-consumer-{partition+1}', # cid
+                f'nexgus-consumer-{idx+1}', # cid
                 args.broker, # broker
-                args.topics, # topics
+                args.topic, # topics
+                partition, # partition
                 args.timeout, # timeout
-                args.mysql, # mysql_host
+                args.mysql, # mysql_host,
+                args.from_start, # from_start
             ), 
         )
         p.start()
@@ -184,11 +246,11 @@ if __name__ == '__main__':
     parser.add_argument('-V', '--version', 
         action='version',
         version=f'{VER_MAJOR}.{VER_MINOR}.{VER_PATCH}')
-    parser.add_argument('-b', '--broker',
-        type=str, required=True,
+    parser.add_argument('broker',
+        type=str,
         help='Broker HOST[:PORT]. Default PORT is 9092.')
-    parser.add_argument('-t', '--topics',
-        type=str, nargs='+', required=True,
+    parser.add_argument('topic',
+        type=str,
         help='Topics.')
     parser.add_argument('-c', '--consumers',
         type=int, default=1,
@@ -196,11 +258,14 @@ if __name__ == '__main__':
     parser.add_argument('--timeout',
         type=float, default=10.0,
         help='Number of seconds to stop after nothing received.')
+    parser.add_argument('-fs', '--from-start',
+        action='store_true',
+        help='Receive from the start.')
     parser.add_argument('--mysql',
         type=str,
         help='MySQL server IP address.')
     parser.add_argument('-l', '--level',
-        type=str, choices=['debug', 'info', 'warning'], default='warning',
+        type=str, choices=['debug', 'info', 'warning'], default='info',
         help='Log level.')
     args = parser.parse_args()
 

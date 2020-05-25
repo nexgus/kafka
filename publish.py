@@ -49,7 +49,16 @@ def create_topic(broker, topic, partitions=1, replicas=1):
         replication_factor=replicas,
     )
 
-    admin = KafkaAdminClient(bootstrap_servers=[args.broker])
+    try:
+        admin = KafkaAdminClient(bootstrap_servers=[args.broker])
+    except kafka.errors.NoBrokersAvailable:
+        logger.warning(f'Cannot establish connection to {broker}. '
+                        f'Producer {cid} is not created.')
+        return
+    except Exception as ex:
+        print(f'----------> {cid}')
+        raise
+
     admin.create_topics([new_topic])
     # create_topics() should be blocking. See 
     # https://github.com/dpkp/kafka-python/blob/2.0.1/kafka/admin/client.py#L373
@@ -58,7 +67,8 @@ def create_topic(broker, topic, partitions=1, replicas=1):
 
 ##############################################################################
 def produce(cid, broker, topic, 
-            partition=0, acks=1, iterations=10, size=None, max_size=4096):
+            partition=0, acks=1, iterations=10, size=None, max_size=4096, 
+            binary=False):
     """Create a producer and generate required messages.
 
     Args:
@@ -83,6 +93,7 @@ def produce(cid, broker, topic,
             length (default None).
         max_size (int): Maximum message length in bytes for random generated 
             message (default 4096).
+        binary (bool): Generate binary data (default False).
     """
     try:
         producer = KafkaProducer(
@@ -102,16 +113,20 @@ def produce(cid, broker, topic,
     source = string.ascii_letters + string.digits + string.punctuation
     for iteration in range(iterations):
         msg_size = random.randint(1, max_size) if size is None else size
-        msg = ''.join(random.choice(source) for _ in range(msg_size))
+        if binary:
+            msg = os.urandom(msg_size)
+        else:
+            msg = ''.join(random.choice(source) for _ in range(msg_size))
+            msg = msg.encode('utf-8')
         future = producer.send( # <class 'kafka.producer.future.FutureRecordMetadata'>
             topic=topic, 
-            value=msg.encode('utf-8'),
+            value=msg,
             partition=partition,)
         r = future.get() # <class 'kafka.producer.future.RecordMetadata'>
         if future.succeeded():
-            logger.info(f'{cid} TX #{iteration} {r.serialized_value_size}.')
+            logger.info(f'{cid}: TX #{iteration} {r.serialized_value_size}.')
         else:
-            logger.warning(f'{cid} TX #{iteration} failed.')
+            logger.warning(f'{cid}: TX #{iteration} failed.')
         time.sleep(0.000001) # Should be fair enough for logging
 
     producer.close()
@@ -154,7 +169,7 @@ def main(args):
         partitions = args.partitions
         create_topic(args.broker, args.topic, partitions, 
                      args.replication_factor)
-        logger.info(f'Topic "{args.topic}" created (partition={artitions}, '
+        logger.info(f'Topic "{args.topic}" created (partition={partitions}, '
                     f'replication factor={args.replication_factor}).')
     else:
         logger.warning(f'Topic "{args.topic}" exists.')
@@ -224,6 +239,9 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--iter-per-producer',
         type=int, default=10,
         help='Iterations. How many record will be published.')
+    parser.add_argument('--binary',
+        action='store_true',
+        help='Send data binary data.')
     parser.add_argument('-s', '--size',
         type=int,
         help='Message length in bytes.')
@@ -231,7 +249,7 @@ if __name__ == '__main__':
         type=int, default=4096,
         help='Maximum message length in bytes.')
     parser.add_argument('-l', '--level',
-        type=str, choices=['debug', 'info', 'warning'], default='warning',
+        type=str, choices=['debug', 'info', 'warning'], default='info',
         help='Log level.')
     args = parser.parse_args()
 
