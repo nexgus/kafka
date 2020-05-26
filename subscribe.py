@@ -28,7 +28,7 @@ logger.setLevel(logging.INFO)
 
 ##############################################################################
 def consume(cid, broker, topic, partition=None,
-            timeout=None, mysql_host=None, from_start=False):
+            timeout=None, mysql_host=None, from_start=False, auto_subscribe=True):
     """ Create a consumer and consumes specified topics.
 
     Args:
@@ -58,7 +58,7 @@ def consume(cid, broker, topic, partition=None,
 
     if isinstance(timeout, float):
         # Convert to milliseconds.
-        timeout = int(args.timeout * 1000)
+        timeout = int(timeout * 1000)
 
     try:
         consumer = KafkaConsumer(
@@ -83,12 +83,17 @@ def consume(cid, broker, topic, partition=None,
     else:
         tp_partition = None
         consumer.subscribe([topic])
-        partition = consumer.assignment().pop()
-    logger.info(f'{cid}: subscribes to "{topic}" @ partition {partition}.')
+        partition_set = consumer.assignment()
+        partition = None if len(partition_set)==0 else partition_set.pop()
+
+    if partition is None:
+        logger.info(f'{cid}: subscribes to "{topic}" but no partition be assigned.')
+    else:
+        logger.info(f'{cid}: subscribes to "{topic}" @ partition {partition}.')
 
     # Seek to beginning
     if from_start and tp_partition:
-        consumer.seek_to_beginning()
+        consumer.seek_to_beginning(tp_partition)
         logger.info(f'{cid}: Seek to beginning.')
 
     index = 0
@@ -103,14 +108,13 @@ def consume(cid, broker, topic, partition=None,
             save_to_mysql(cnx, message)
             logger.info(f'{cid}: Save message to MySQL ({mysql_host}).')
         index += 1
+        time.sleep(0.000001)
 
     consumer.close()
     logger.info(f'{cid}: Close.')
     if mysql_host:
         cnx.close()
         logger.info(f'{cid}: Close MySql ({mysql_host})')
-
-    time.sleep(0.000001)
 
 ##############################################################################
 def save_to_mysql(cnx, record, cid=''):
@@ -214,10 +218,9 @@ def main(args):
 
     processes = []
     for idx in range(args.consumers):
-        partition = None
-        if len(partitions) > 0:
-            partition = partitions.pop()
-
+        logger.debug(f'--- len(partitions)={len(partitions)}')
+        partition = None if len(partitions)==0 else partitions.pop()
+        logger.debug(f'+++ len(partitions)={len(partitions)}')
         p = Process(
             target=consume, 
             args=(
@@ -230,6 +233,7 @@ def main(args):
                 args.from_start, # from_start
             ), 
         )
+        processes.append(p)
         p.start()
 
     for p in processes:

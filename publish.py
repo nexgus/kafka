@@ -7,6 +7,7 @@ import random
 import string
 import time
 
+from datetime import datetime
 from kafka import KafkaAdminClient
 from kafka import KafkaConsumer
 from kafka import KafkaProducer
@@ -30,7 +31,7 @@ LOG_LEVELS = {
 }
 
 logger = logging.getLogger('nexgus-publish')
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 ##############################################################################
 def create_topic(broker, topic, partitions=1, replicas=1):
@@ -95,6 +96,7 @@ def produce(cid, broker, topic,
             message (default 4096).
         binary (bool): Generate binary data (default False).
     """
+    logger.debug(f'Creating {cid}.')
     try:
         producer = KafkaProducer(
             bootstrap_servers=[broker],
@@ -124,7 +126,12 @@ def produce(cid, broker, topic,
             partition=partition,)
         r = future.get() # <class 'kafka.producer.future.RecordMetadata'>
         if future.succeeded():
-            logger.info(f'{cid}: TX #{iteration} {r.serialized_value_size}.')
+            #logger.info(f'{cid}: TX #{iteration} {r.serialized_value_size}.')
+            time_str = datetime.fromtimestamp(r.timestamp / 1000).strftime(
+                '%Y/%m/%d %H:%M:%S.%f'
+            )
+            logger.info(f'{cid}: [{time_str}] {r.topic} '
+                    f'RX #{iteration} {r.serialized_value_size}')
         else:
             logger.warning(f'{cid}: TX #{iteration} failed.')
         time.sleep(0.000001) # Should be fair enough for logging
@@ -166,7 +173,7 @@ def topic_partitions(topic, broker):
 def main(args):
     partitions = topic_partitions(args.topic, args.broker)
     if partitions is None:
-        partitions = args.partitions
+        partitions = set([p for p in range(args.partitions)])
         create_topic(args.broker, args.topic, partitions, 
                      args.replication_factor)
         logger.info(f'Topic "{args.topic}" created (partition={partitions}, '
@@ -177,11 +184,12 @@ def main(args):
             logger.warning(f'Since only {len(partitions)} for topic, the '
                            f'producer count is reduced to {len(partitions)}.')
         else:
-            logger.info(f'{args.producers}-producer be created.')
+            logger.info(f'{args.producers}-producer will be created.')
 
     processes = []
     for idx in range(args.producers):
         partition = partitions.pop()
+        logger.debug(f'Producer for partition {partition}.')
         p = Process(
             target=produce, 
             args=(
@@ -193,6 +201,7 @@ def main(args):
                 args.iter_per_producer,
                 args.size,
                 args.max_size,
+                args.binary,
             ), 
         )
         processes.append(p)
@@ -262,6 +271,7 @@ if __name__ == '__main__':
     ch.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     logger.addHandler(ch)
 
+    logger.debug(f'{args}')
     main(args)
 
 '''
