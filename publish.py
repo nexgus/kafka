@@ -44,26 +44,34 @@ def create_topic(broker, topic, partitions=1, replicas=1):
         partitions (int): Partion count (default 1).
         replicas (int): Replica count (default 1).
     """
-    new_topic = NewTopic(
-        name=topic, 
-        num_partitions=partitions, 
-        replication_factor=replicas,
-    )
-
     try:
         admin = KafkaAdminClient(bootstrap_servers=[args.broker])
     except kafka.errors.NoBrokersAvailable:
-        logger.warning(f'Cannot establish connection to {broker}. '
-                        f'Producer {cid} is not created.')
+        logger.warning(f'Cannot establish connection to {broker} while '
+                       f'creating topic "{topic}".')
+        return
+    except kafka.errors.NodeNotReadyError:
+        logger.critical(f'Got a NodeNotReadyError. Please check the broker '
+                         'configuration.')
         return
     except Exception as ex:
-        print(f'----------> {cid}')
+        print('----------> create_topic()')
         raise
 
-    admin.create_topics([new_topic])
-    # create_topics() should be blocking. See 
-    # https://github.com/dpkp/kafka-python/blob/2.0.1/kafka/admin/client.py#L373
-    # for detail.
+    try:
+        admin.create_topics([
+            NewTopic(
+                name=topic, 
+                num_partitions=partitions, 
+                replication_factor=replicas,
+            ),
+        ])
+        # create_topics() should be blocking. See 
+        # https://github.com/dpkp/kafka-python/blob/2.0.1/kafka/admin/client.py#L373
+        # for detail.
+    except kafka.errors.TopicAlreadyExistsError:
+        logger.warning(f'Cannot create topic {topic} since it exists.')
+
     admin.close()
 
 ##############################################################################
@@ -120,18 +128,26 @@ def produce(cid, broker, topic,
         else:
             msg = ''.join(random.choice(source) for _ in range(msg_size))
             msg = msg.encode('utf-8')
+
+        # In order to compare timestamp in subscriber, we add timestamp manually
+        # Note that a timestamp in Kafka is in milliseconds, and Python 
+        # time.time() return a float in seconds.
+        timestamp = int(time.time() * 1000)
         future = producer.send( # <class 'kafka.producer.future.FutureRecordMetadata'>
             topic=topic, 
             value=msg,
-            partition=partition,)
+            partition=partition,
+            timestamp_ms=timestamp,
+        )
         r = future.get() # <class 'kafka.producer.future.RecordMetadata'>
         if future.succeeded():
-            #logger.info(f'{cid}: TX #{iteration} {r.serialized_value_size}.')
             time_str = datetime.fromtimestamp(r.timestamp / 1000).strftime(
                 '%Y/%m/%d %H:%M:%S.%f'
             )
-            logger.info(f'{cid}: [{time_str}] {r.topic} '
-                    f'RX #{iteration} {r.serialized_value_size}')
+            logger.info(
+                f'{cid}: [{time_str}] {r.topic} '
+                f'TX #{iteration} {r.serialized_value_size}'
+            )
         else:
             logger.warning(f'{cid}: TX #{iteration} failed.')
         time.sleep(0.000001) # Should be fair enough for logging
@@ -173,9 +189,9 @@ def topic_partitions(topic, broker):
 def main(args):
     partitions = topic_partitions(args.topic, args.broker)
     if partitions is None:
-        partitions = set([p for p in range(args.partitions)])
-        create_topic(args.broker, args.topic, partitions, 
+        create_topic(args.broker, args.topic, args.partitions, 
                      args.replication_factor)
+        partitions = set([p for p in range(args.partitions)])
         logger.info(f'Topic "{args.topic}" created (partition={partitions}, '
                     f'replication factor={args.replication_factor}).')
     else:
@@ -221,11 +237,11 @@ if __name__ == '__main__':
     parser.add_argument('-V', '--version', 
         action='version',
         version=f'{VER_MAJOR}.{VER_MINOR}.{VER_PATCH}')
-    parser.add_argument('-b', '--broker',
-        type=str, required=True,
+    parser.add_argument('broker',
+        type=str,
         help='Broker HOST[:PORT]. Default PORT is 9092.')
-    parser.add_argument('-t', '--topic',
-        type=str, required=True,
+    parser.add_argument('topic',
+        type=str,
         help='Topic.')
     parser.add_argument('-a', '--acks',
         choices=['0', '1', 'all'], default='1',

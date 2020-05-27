@@ -1,0 +1,4 @@
+#!/bin/bash
+docker rm -f zookeeper kafka
+docker volume rm zookeeper kafka
+

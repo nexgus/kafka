@@ -1,5 +1,7 @@
 #/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import base64
+import hashlib
 import kafka.errors
 import logging
 import mysql.connector
@@ -26,9 +28,30 @@ LOG_LEVELS = {
 logger = logging.getLogger('nexgus-publish')
 logger.setLevel(logging.INFO)
 
+MYSQL_CREATE_TABLE = (
+    'CREATE TABLE `kafka`.`general` ('
+    '  `sha256` CHAR(64) NOT NULL,'
+    '  `topic` TEXT NOT NULL,'
+    '  `partition` DECIMAL UNSIGNED NOT NULL,'
+    '  `offset` DECIMAL UNSIGNED NOT NULL,'
+    '  `timestamp` BIGINT UNSIGNED NOT NULL,'
+    '  `timestamp_type` DECIMAL UNSIGNED NULL,'
+    '  `key` TEXT NULL,'
+    '  `value` TEXT NOT NULL,'
+    '  `header` TEXT NULL,'
+    '  `checksum` TEXT NULL,'
+    '  `serialized_key_size` DECIMAL NOT NULL,'
+    '  `serialized_value_size` DECIMAL NOT NULL,'
+    '  `serialized_header_size` DECIMAL NOT NULL,'
+    '  PRIMARY KEY (`sha256`))'
+    'ENGINE = InnoDB'
+    'DEFAULT CHARACTER SET = utf8'
+)
+
 ##############################################################################
-def consume(cid, broker, topic, partition=None,
-            timeout=None, mysql_host=None, from_start=False, auto_subscribe=True):
+def consume(cid, broker, topic, partition,
+            timeout=1.0, mysql_host=None, from_start=False, 
+            auto_subscribe=True):
     """ Create a consumer and consumes specified topics.
 
     Args:
@@ -40,33 +63,39 @@ def consume(cid, broker, topic, partition=None,
         broker (str): The 'host[:port]' string that the producer should 
             contact to bootstrap initial cluster metadata.
         topic (str): Topic.
-        partition (int): The partition number of specified topic (default 
-            None).
+        partition (int): The partition number of specified topic.
         timeout (float): Number of seconds to block during message iteration 
-            before close (default None).
+            before close (default 1.0).
         mysql_host (str): Host name or IP address of MySQL server. If this is 
             specified, all messages will be saved in it (default None).
         from_start (bool): Receive message from the beginning (default False)
     """
     if mysql_host:
+        mysql_port = 3306
+        if ':' in mysql_host:
+            mysql_host, mysql_port = mysql_host.split(':')
+            mysql_port = int(mysql_port)
+
+        # to-do: What if MySQL server doesn't exist?
         cnx = mysql.connector.connect(
             user='root', 
             password='0000', 
             host=mysql_host, 
+            port=mysql_port, 
             database='kafka'
         )
+        logger.info(f'Connection to MySQL server {mysql_host}:{mysql_port} '
+                     'is established.')
 
-    if isinstance(timeout, float):
-        # Convert to milliseconds.
-        timeout = int(timeout * 1000)
+    # Convert to milliseconds.
+    timeout = int(timeout * 1000)
 
     try:
         consumer = KafkaConsumer(
             bootstrap_servers=[broker],
             client_id=cid,
             group_id='nexgus-consumer-group',
-            auto_offset_reset='earliest',
-            consumer_timeout_ms=timeout,
+            consumer_timeout_ms=30000, # 30 seconds
         )
     except kafka.errors.NoBrokersAvailable:
         logger.warning(f'Cannot establish connection to {broker}. '
@@ -76,48 +105,44 @@ def consume(cid, broker, topic, partition=None,
         print(f'----------> {cid}')
         raise
 
-    # Subscribe
-    if isinstance(partition, int):
-        tp_partition = TopicPartition(topic, partition)
-        consumer.assign([tp_partition])
-    else:
-        tp_partition = None
-        consumer.subscribe([topic])
-        partition_set = consumer.assignment()
-        partition = None if len(partition_set)==0 else partition_set.pop()
-
-    if partition is None:
-        logger.info(f'{cid}: subscribes to "{topic}" but no partition be assigned.')
-    else:
-        logger.info(f'{cid}: subscribes to "{topic}" @ partition {partition}.')
+    # Subscribe to the topic
+    # We don't use dynamically partition assignment (subscribe()) since we 
+    # have to use seed_to_beginning().
+    tp_partition = TopicPartition(topic, partition)
+    consumer.assign([tp_partition])
+    logger.info(f'{cid}: Subscribes to "{topic}" @ partition {partition}.')
 
     # Seek to beginning
-    if from_start and tp_partition:
+    if from_start:
         consumer.seek_to_beginning(tp_partition)
         logger.info(f'{cid}: Seek to beginning.')
 
     index = 0
     for record in consumer:
         # A record is an instance of <kafka.consumer.fetcher.ConsumerRecord>
-        time_str = datetime.fromtimestamp(record.timestamp / 1000).strftime(
+        timestamp = datetime.fromtimestamp(record.timestamp / 1000).strftime(
             '%Y/%m/%d %H:%M:%S.%f'
         )
-        logger.info(f'{cid}: [{time_str}] {record.topic} '
+        logger.info(f'{cid}: [{timestamp}] "{record.topic}" '
                     f'RX #{index} {record.serialized_value_size}')
         if mysql_host:
-            save_to_mysql(cnx, message)
-            logger.info(f'{cid}: Save message to MySQL ({mysql_host}).')
+            save_to_mysql(cnx, record)
+            logger.debug(f'{cid}: Save message to MySQL '
+                         f'({mysql_host}:{mysql_port}).')
         index += 1
         time.sleep(0.000001)
+        if consumer.config['consumer_timeout_ms'] != timeout:
+            consumer.config['consumer_timeout_ms'] = timeout
+            logger.debug(f'{cid}: Set consumer.timeout.ms to {timeout}.')
 
     consumer.close()
     logger.info(f'{cid}: Close.')
     if mysql_host:
         cnx.close()
-        logger.info(f'{cid}: Close MySql ({mysql_host})')
+        logger.info(f'{cid}: Close MySQL ({mysql_host}:{mysql_port})')
 
 ##############################################################################
-def save_to_mysql(cnx, record, cid=''):
+def save_to_mysql(cnx, record):
     """Save a record to specified MySQL server.
 
     Args:
@@ -125,28 +150,40 @@ def save_to_mysql(cnx, record, cid=''):
             is connected to the MySQL server.
         record (kafka.consumer.fetcher.ConsumerRecord): An object to 
             represent received Kafka message.
-        cid (str): A consumer's name. This name is used to be associated with 
-            id to prevent duplicated index since each consumer is in an 
-            independant process.
     """
-    pkey = hash(cid + datetime.datetime.now().strftime('%Y%m%d%H%M%S.%f'))
-    payload = ''
-    if record.value: pkey = base64.b64encode(record.value).decode('utf-8')
-    q = ( "INSERT INTO kafka.general (pkey, topic, partition, offset, "
-          "timestamp, timestamp_type, value, serialized_key_size, "
-          "serialized_value_size, serialized_header_size) VALUES ('{pkey}', "
-         f"'{record.topic}', '{record.partition}', '{record.offset}', "
-         f"'{record.timestamp}', '{record.timestamp_type}', '{payload}', "
-         f"'{record.serialized_key_size}', '{record.serialized_value_size}, "
-         f"'{record.serialized_header_size}')")
+    key = '-'.join([
+        f'{record.topic}',
+        f'{record.partition}',
+        datetime.fromtimestamp(
+            record.timestamp/1000
+        ).strftime('%Y/%m/%d %H:%M:%S.%f'),
+    ])
+    sha256 = hashlib.sha256(key.encode('utf-8')).hexdigest()
+    if record.value:
+        payload = base64.b64encode(record.value).decode('utf-8')
+    else:
+        payload = ''
+    q = ( "INSERT INTO kafka.general ("
+            "sha256, topic, partition, offset, timestamp, timestamp_type, "
+            "value, serialized_key_size, serialized_value_size, "
+            "serialized_header_size) "
+          "VALUES ("
+            f"'{sha256}', '{record.topic}', '{record.partition}', "
+            f"'{record.offset}', '{record.timestamp}', "
+            f"'{record.timestamp_type}', '{payload}', "
+            f"'{record.serialized_key_size}', "
+            f"'{record.serialized_value_size}', "
+            f"'{record.serialized_header_size}')"
+    )
     cursor = cnx.cursor()
     try:
         cursor.execute(q)
     except mysql.connector.errors.ProgrammingError:
-        print(q)
+        logger.error(q)
         raise
-    except Exception as ex:
-        raise
+    except mysql.connector.errors.IntegrityError as ex:
+        # The primary key exists. Maybe it is a duplication. Skip it.
+        pass
     cnx.commit()
     cursor.close()
 
@@ -184,33 +221,40 @@ def topic_partitions(topic, broker):
 ##############################################################################
 def main(args):
     if args.mysql:
-        cnx = mysql.connector.connect(
-            user='root', 
-            password='0000', 
-            host=args.mysql
-        )
-        cnx.cmd_query('DROP DATABASE IF EXISTS kafka')
-        logger.warning('Erase existed MySQL database.')
-        cnx.cmd_query('CREATE DATABASE kafka')
-        cnx.cmd_query('USE kafka')
-        cnx.cmd_query('CREATE TABLE `kafka`.`general` ('
-                      '  `pkey` DECIMAL NOT NULL,'
-                      '  `topic` TEXT NOT NULL,'
-                      '  `partition` DECIMAL UNSIGNED NOT NULL,'
-                      '  `offset` DECIMAL UNSIGNED NOT NULL,'
-                      '  `timestamp` BIGINT UNSIGNED NOT NULL,'
-                      '  `timestamp_type` DECIMAL UNSIGNED NULL,'
-                      '  `key` TEXT NULL,'
-                      '  `value` TEXT NOT NULL,'
-                      '  `header` TEXT NULL,'
-                      '  `checksum` TEXT NULL,'
-                      '  `serialized_key_size` DECIMAL NOT NULL,'
-                      '  `serialized_value_size` DECIMAL NOT NULL,'
-                      '  `serialized_header_size` DECIMAL NOT NULL,'
-                      '  PRIMARY KEY (`id`))'
-                      'ENGINE = InnoDB'
-                      'DEFAULT CHARACTER SET = utf8')
-        cnx.close()
+        if ':' in args.mysql:
+            mysql_host, mysql_port = args.mysql.split(':')
+            mysql_port = int(mysql_port)
+        else:
+            mysql_host, mysql_port = args.mysql, 3306
+
+        try:
+            cnx = mysql.connector.connect(
+                user='root', 
+                password='0000', 
+                host=mysql_host,
+                port=mysql_port,
+                database='kafka',
+            )
+        except mysql.connector.errors.ProgrammingError:
+            logger.warning('Database does not exist. Create database.')
+            cnx = mysql.connector.connect(
+                user='root', 
+                password='0000', 
+                host=mysql_host,
+                port=mysql_port,
+            )
+            cnx.cmd_query('CREATE DATABASE kafka')
+            cnx.cmd_query('USE kafka')
+            cnx.cmd_query(MYSQL_CREATE_TABLE)
+        else:
+            if args.delete:
+                logger.warning('Erase existed database.')
+                cnx.cmd_query('DROP DATABASE kafka')
+                cnx.cmd_query('CREATE DATABASE kafka')
+                cnx.cmd_query('USE kafka')
+                cnx.cmd_query(MYSQL_CREATE_TABLE)
+        finally:
+            cnx.close()
 
     partitions = topic_partitions(args.topic, args.broker)
     if partitions is None:
@@ -255,19 +299,22 @@ if __name__ == '__main__':
         help='Broker HOST[:PORT]. Default PORT is 9092.')
     parser.add_argument('topic',
         type=str,
-        help='Topics.')
+        help='A topic to subscribe to.')
     parser.add_argument('-c', '--consumers',
         type=int, default=1,
         help='Number of consumers.')
     parser.add_argument('--timeout',
-        type=float, default=10.0,
+        type=float, default=1.0,
         help='Number of seconds to stop after nothing received.')
     parser.add_argument('-fs', '--from-start',
         action='store_true',
         help='Receive from the start.')
     parser.add_argument('--mysql',
         type=str,
-        help='MySQL server IP address.')
+        help='MySQL server IP host[:port]. Default port is 3306.')
+    parser.add_argument('-del', '--delete',
+        action='store_true',
+        help='Delete existed database anyway.')
     parser.add_argument('-l', '--level',
         type=str, choices=['debug', 'info', 'warning'], default='info',
         help='Log level.')

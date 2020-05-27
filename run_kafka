@@ -1,0 +1,18 @@
+#!/bin/bash
+docker run --name zookeeper -d \
+  -v zookeeper:/var/lib/zookeeper \
+  --restart unless-stopped \
+  nexgus/zookeeper.jre:3.6.1
+
+docker run --name kafka -d \
+  --link zookeeper \
+  -p 9092:9092 \
+  -v kafka:/var/lib/kafka \
+  -e KK_LISTENERS=INSIDE://:9094,OUTSIDE://:9092 \
+  -e KK_ADVERTISED_LISTENERS=INSIDE://localhost:9094,OUTSIDE://172.31.0.145:9092 \
+  -e KK_LISTENER_SECURITY_PROTOCOL_MAP=INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT \
+  -e KK_INTER_BROKER_LISTENER_NAME=INSIDE \
+  -e KK_ZOOKEEPER_CONNECT=zookeeper:2181/kafka \
+  --restart unless-stopped \
+  nexgus/kafka.jre:2.12-2.4.1
+
